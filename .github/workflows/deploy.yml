@@ -1,0 +1,97 @@
+name: Full Stack CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER: fullstack-eks-cluster
+  ECR_BACKEND: fullstack-backend
+  ECR_FRONTEND: fullstack-frontend
+  K8S_NAMESPACE: fullstack
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image variables
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+          echo "REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Build backend image
+        run: |
+          docker build \
+            -t "$REGISTRY/$ECR_BACKEND:$IMAGE_TAG" \
+            ./backend
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t "$REGISTRY/$ECR_FRONTEND:$IMAGE_TAG" \
+            ./frontend
+
+      - name: Push backend image
+        run: |
+          docker push "$REGISTRY/$ECR_BACKEND:$IMAGE_TAG"
+
+      - name: Push frontend image
+        run: |
+          docker push "$REGISTRY/$ECR_FRONTEND:$IMAGE_TAG"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
+
+      - name: Deploy backend
+        run: |
+          sed "s|BACKEND_IMAGE|$REGISTRY/$ECR_BACKEND:$IMAGE_TAG|g" \
+            k8s/backend.yaml | kubectl apply -f -
+
+      - name: Deploy frontend
+        run: |
+          sed "s|FRONTEND_IMAGE|$REGISTRY/$ECR_FRONTEND:$IMAGE_TAG|g" \
+            k8s/frontend.yaml | kubectl apply -f -
+
+      - name: Verify backend
+        run: |
+          kubectl rollout status \
+            deployment/backend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s
+
+      - name: Verify frontend
+        run: |
+          kubectl rollout status \
+            deployment/frontend \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s
+
+      - name: Show deployment
+        run: |
+          kubectl get pods -n "$K8S_NAMESPACE"
+          kubectl get services -n "$K8S_NAMESPACE"
